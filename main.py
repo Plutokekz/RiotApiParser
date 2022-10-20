@@ -1,4 +1,5 @@
 import os
+from pprint import pprint
 from typing import Optional
 
 import requests
@@ -10,6 +11,7 @@ import logging
 from datamodel_code_generator import InputFileType, generate
 from pathlib import Path
 import argparse
+from lexer import Lexer, TokenType, Parser
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__file__)
@@ -18,21 +20,49 @@ RawProperty = namedtuple('RawProperty', ['name', 'type', 'description'])
 RawBlock = namedtuple('RawBlock', ['name', 'raw_properties'])
 Api = namedtuple("Api", ['name', 'endpoints'])
 Endpoint = namedtuple('Endpoint', ['name', 'href'])
-
+token_mapping = {
+    'string': TokenType.STRING,
+    'int': TokenType.INTEGER,
+    'long': TokenType.LONG,
+    'float': TokenType.FLOAT,
+    'double': TokenType.DOUBLE,
+    'boolean': TokenType.BOOLEAN,
+    'list': TokenType.LIST,
+    'map': TokenType.MAP
+}
 CONVERT = {
-    'string': 'string',
-    'int': 'integer',
-    'long': 'integer',
-    'float': 'number',
-    'boolean': 'boolean'
+    TokenType.STRING: 'string',
+    TokenType.INTEGER: 'integer',
+    TokenType.LONG: 'integer',
+    TokenType.FLOAT: 'number',
+    TokenType.DOUBLE: 'number',
+    TokenType.BOOLEAN: 'boolean'
 }
 
+lexer = Lexer(token_mapping)
+parser = Parser(CONVERT)
+#CONVERT = {
+#    'string': 'string',
+#    'int': 'integer',
+#    'long': 'integer',
+#    'float': 'number',
+#    'double': 'number',
+#    'boolean': 'boolean'
+#}
+
 PARSED = []
+char_set = set()
 
 
-def parse_type(type_: str) -> dict:
+def parse_map(type_: str):
+    ...
+
+
+def parse_type(type_: str, convert: dict[str, str] = CONVERT) -> dict:
     # convert the types from the RiotApi to the Pydantic types
-    if n := CONVERT.get(type_):
+    for c in type_:
+        char_set.update(c)
+    if n := convert.get(type_):
         return {"type": n}
     # handel the list / array types
     if type_.startswith("List") or type_.startswith("Set"):
@@ -53,7 +83,9 @@ def parse_list(type_: str) -> dict:
 
 def parse_property(raw_property: RawProperty) -> dict:
     # parse type
-    property_ = parse_type(raw_property.type)
+    # property_ = parse_type(raw_property.type)
+    token = list(lexer.lex_string(raw_property.type))
+    property_ = parser.parse(token)
     # add description if exists
     if raw_property.description:
         property_['description'] = raw_property.description
@@ -104,7 +136,7 @@ def parse_entry(entry) -> tuple[str, str, str]:
     return name, api_name, href
 
 
-def parse_entries(url: str = 'https://developer.riotgames.com/apis', parser='lxml'):
+def parse_entries(url: str, parser='lxml'):
     r = requests.get(url)
     site = BeautifulSoup(r.text, features=parser)
     match = site.find('div', class_="scrollable-container")
@@ -112,7 +144,7 @@ def parse_entries(url: str = 'https://developer.riotgames.com/apis', parser='lxm
     return match.find_all('li')
 
 
-def get_api_endpoints(url: str, parser: str) -> dict[str, Api]:
+def get_api_endpoints(url: str = "https://developer.riotgames.com/apis", parser: str = "lxml") -> dict[str, Api]:
     apis = {}
     for entry in parse_entries(url, parser):
         name, api_name, href = parse_entry(entry)
@@ -189,25 +221,24 @@ def generate_python_code(out_path: str = "python", json_path: str = "models"):
             os.mkdir(output_dir)
         for file in os.listdir(path):
             file_path = Path(os.path.join(path, file))
-            logger.debug(f"read json file from: {file_path}")
+            logger.info(f"parsing {file_path} to python")
             output = Path(os.path.join(output_dir, f"{file.split('.')[0]}.py"))
             logger.debug(f"save generated python file to: {output}")
             generate(file_path, input_file_type=InputFileType.JsonSchema, input_filename=file, output=output)
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument('-p', '--parser', default='lxml', dest='parser', help='select a parser for bs4, default: lxml',
-                        required=True)
-    parser.add_argument('-jp', '--jsonpath', required=True, default='models',
+    arg_parser = argparse.ArgumentParser()
+    arg_parser.add_argument('-p', '--parser', default='lxml', dest='parser', help='select a parser for bs4, default: lxml')
+    arg_parser.add_argument('-jp', '--jsonpath', default='models',
                         help='Path to store the json schema file, default: models', dest='json_path')
-    parser.add_argument('-pp', '--pythonpath', required=True, default='python',
+    arg_parser.add_argument('-pp', '--pythonpath', default='python',
                         help='Path to store the python file, default: python',
                         dest='python_path')
-    parser.add_argument('-u', '--url', required=True, default='https://developer.riotgames.com/apis',
+    arg_parser.add_argument('-u', '--url', default='https://developer.riotgames.com/apis',
                         help='url to riot developers page with the api documentation, default: https://developer.riotgames.com/apis',
                         dest='url')
-    args = parser.parse_args()
+    args = arg_parser.parse_args()
 
     api_endpoints = get_api_endpoints(args.url, args.parser)
     parse_apis(apis=api_endpoints, parser=args.parser, url=args.url, path=args.json_path)
