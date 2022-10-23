@@ -1,10 +1,11 @@
 import os
 from pprint import pprint
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List, Generator, Callable, Tuple
 
 import requests
-from bs4 import BeautifulSoup
-from requests_html import HTMLSession
+from bs4 import BeautifulSoup, ResultSet
+from requests_html import AsyncHTMLSession
+from requests import Response
 import json
 from collections import namedtuple
 import logging
@@ -40,30 +41,18 @@ CONVERT = {
     TokenType.BOOLEAN: 'boolean'
 }
 
-lexer = Lexer(token_mapping)
-parser = Parser(CONVERT)
-# CONVERT = {
-#    'string': 'string',
-#    'int': 'integer',
-#    'long': 'integer',
-#    'float': 'number',
-#    'double': 'number',
-#    'boolean': 'boolean'
-# }
-
-PARSED = []
-char_set = set()
-
 
 class WebsiteParser:
     lexer: Lexer
     parser: Parser
     htmlparser: str
+    parsed: List
 
-    def __init__(self, token_type_mapping, type_map, htmlparser: str):
+    def __init__(self, token_type_mapping: Dict[str, TokenType], type_map: Dict[TokenType, str], htmlparser: str):
         self.lexer = Lexer(token_type_mapping)
         self.parser = Parser(type_map)
         self.htmlparser = htmlparser
+        self.parsed = []
 
     def _parse_property(self, raw_property: RawProperty) -> Dict[str, Any]:
         # parse type
@@ -79,8 +68,8 @@ class WebsiteParser:
         if name := block.find("h5"):
             name = name.text.strip()
             # check is class got already parsed
-            if name not in PARSED:
-                PARSED.append(name)
+            if name not in self.parsed:
+                self.parsed.append(name)
                 raw_block = RawBlock(name, [])
                 body = block.find("tbody")
 
@@ -89,10 +78,11 @@ class WebsiteParser:
                     name, type_, description = [x.text.strip() for x in row.find_all("td")][:3]
                     raw_block.raw_properties.append(RawProperty(name, type_, description))
                 return raw_block
+        return None
 
-    def _parse_response_block_to_definition(self, block: RawBlock) -> dict:
+    def _parse_response_block_to_definition(self, block: RawBlock) -> Dict[str, Any]:
         # create dict definition dict with the name of the definition and an empty properties dict
-        definition = {block.name: {"properties": {}}}
+        definition: Dict[str, Any] = {block.name: {"properties": {}}}
         for raw_property in block.raw_properties:
             # update the properties
             definition[block.name]["properties"].update(self._parse_property(raw_property))
@@ -111,26 +101,28 @@ class WebsiteParser:
         operations = operations.find_all("li", "operation")
         return operations
 
-    def parse(self, site: str) -> Dict[str, Any]:
+    def parse(self, site: Response) -> Generator[Dict[str, Any], None, None]:
+        self.parsed[:] = []
         site = BeautifulSoup(site.html.html, features=self.htmlparser)
-        operation = self._parse_operations(site)
-        content = operation.find("div", "api_block")
-        schema = {'title': "ERROR"}
-        definitions = False
-        for response_block in content.find_all("div", "response_body"):
-            if raw_block := self._parse_block_response_body(response_block):
-                if not definitions:
-                    schema.update(self._parse_response_block_to_schema(raw_block))
-                    definitions = True
-                else:
-                    definition = self._parse_response_block_to_definition(raw_block)
-                    if n := schema.get('definitions'):
-                        n.update(definition)
+        operations = self._parse_operations(site)
+        for operation in operations:
+            content = operation.find("div", "api_block")
+            schema = {'title': "ERROR"}
+            definitions = False
+            for response_block in content.find_all("div", "response_body"):
+                if raw_block := self._parse_block_response_body(response_block):
+                    if not definitions:
+                        schema.update(self._parse_response_block_to_schema(raw_block))
+                        definitions = True
                     else:
-                        schema['definitions'] = definition
+                        definition = self._parse_response_block_to_definition(raw_block)
+                        if n := schema.get('definitions'):
+                            n.update(definition)
+                        else:
+                            schema['definitions'] = definition
 
-        # save the json schema if exist
-        return schema
+            # save the json schema if exist
+            yield schema
 
 
 class ApiParser:
@@ -144,16 +136,16 @@ class ApiParser:
         name, api_name, href = name.strip(), api_name.strip(), href.strip()
         return name, api_name, href
 
-    def _parse_entries(self, url: str, parser='lxml'):
+    def _parse_entries(self, url: str, parser='lxml') -> ResultSet:
         r = requests.get(url)
         site = BeautifulSoup(r.text, features=parser)
         match = site.find('div', class_="scrollable-container")
         match = match.find('ul')
         return match.find_all('li')
 
-    def parse(self, url: str = "https://developer.riotgames.com/apis", parser: str = "lxml") -> dict[
+    def parse(self, url: str = "https://developer.riotgames.com/apis", parser: str = "lxml") -> Dict[
         str, Api]:
-        apis = {}
+        apis: Dict[str, Api] = {}
         for entry in self._parse_entries(url, parser):
             name, api_name, href = self._parse_entry(entry)
             if n := apis.get(name):
@@ -163,35 +155,41 @@ class ApiParser:
         return apis
 
 
-def parse_apis(apis: dict[str, Api], path: str = "models",
-               parser: str = "lxml", js_load_time: int = 3):
-    session = HTMLSession()
-    if not os.path.exists(path):
-        os.mkdir(path)
-    for name, api in apis.items():
-        logger.info(f"current api: {name}")
-        logger.debug(name, api)
-        api_path = os.path.join(path, name)
-        if not os.path.exists(api_path):
-            os.mkdir(api_path)
-        for endpoint in api.endpoints:
-            logger.info(f"current endpoint: {endpoint.name}")
-            logger.debug(endpoint)
-            # get the side os the endpoint
-            site = session.get(f'{URL}{endpoint.href}')
+class JsonSchemaGenerator:
+
+    session: AsyncHTMLSession
+    parser: WebsiteParser
+
+    def __init__(self):
+        self.session = AsyncHTMLSession()
+        self.parser = WebsiteParser(htmlparser="lxml", type_map=CONVERT, token_type_mapping=token_mapping)
+
+    def generate_call(self, endpoint: Endpoint, js_load_time: int) -> Callable:
+        async def get_and_render_site() -> Tuple[Response, Endpoint]:
+            site = await self.session.get(f'{URL}{endpoint.href}')
             logger.debug(site)
+            logger.info(f"current endpoint: {endpoint.name}, {endpoint.href}")
             # render the site aka load the java-script, wait 3 sec to let it load
-            site.html.render(sleep=js_load_time)
-            # parse site with bs4
+            await site.html.arender(sleep=js_load_time, timeout=30)
+            return site, endpoint
 
-                # save the json schema if exist
-                if schema['title'] != "ERROR":
-                    with open(os.path.join(api_path, f"{schema['title']}.json"), "w") as fp:
-                        json.dump(schema, fp)
+        return get_and_render_site
 
-                # cleanup
-                PARSED[:] = []
-                del schema
+    def parse_apis(self, apis: dict[str, Api], path: str = "models"):
+        if not os.path.exists(path):
+            os.mkdir(path)
+        for name, api in apis.items():
+            logger.info(f"current api: {name}")
+            logger.debug(name, api)
+            api_path = os.path.join(path, name)
+            if not os.path.exists(api_path):
+                os.mkdir(api_path)
+            results = self.session.run(*[self.generate_call(endpoint, 3) for endpoint in api.endpoints])
+            for site, endpoint in results:
+                for schema in self.parser.parse(site):
+                    if schema['title'] != "ERROR":
+                        with open(os.path.join(api_path, f"{schema['title']}.json"), "w") as fp:
+                            json.dump(schema, fp)
 
 
 def generate_python_code(out_path: str = "python", json_path: str = "models"):
@@ -225,6 +223,7 @@ if __name__ == "__main__":
     args = arg_parser.parse_args()
 
     endpoints_parser = ApiParser()
+    json_generator = JsonSchemaGenerator()
     api_endpoints = endpoints_parser.parse(args.url, args.parser)
-    parse_apis(apis=api_endpoints, parser=args.parser, url=args.url, path=args.json_path)
+    json_generator.parse_apis(apis=api_endpoints, path=args.json_path)
     generate_python_code(out_path=args.python_path, json_path=args.json_path)
