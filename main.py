@@ -156,7 +156,6 @@ class ApiParser:
 
 
 class JsonSchemaGenerator:
-
     session: AsyncHTMLSession
     parser: WebsiteParser
 
@@ -205,7 +204,10 @@ def generate_python_code(out_path: str = "python", json_path: str = "models"):
             logger.info(f"parsing {file_path} to python")
             output = Path(os.path.join(output_dir, f"{file.split('.')[0]}.py"))
             logger.debug(f"save generated python file to: {output}")
-            generate(file_path, input_file_type=InputFileType.JsonSchema, input_filename=file, output=output)
+            try:
+                generate(file_path, input_file_type=InputFileType.JsonSchema, input_filename=file, output=output)
+            except KeyError as e:
+                logger.error(f"Json Schema is missing a key: {e}")
 
 
 if __name__ == "__main__":
